@@ -21,9 +21,12 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -32,11 +35,63 @@ import uuid
 from pathlib import Path
 
 APP = "ytscribe"
-DATA_DIR = Path(os.environ.get("YTSCRIBE_HOME", Path.home() / ".local" / "share" / APP))
+IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
+
+
+def _default_data_dir() -> Path:
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support" / APP
+    if IS_WIN:
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP
+
+
+DATA_DIR = Path(os.environ.get("YTSCRIBE_HOME") or _default_data_dir())
 BIN_DIR = DATA_DIR / "bin"
 MODEL_DIR = DATA_DIR / "models"
 
 VIBE_REPO = "thewh1teagle/vibe"
+VIBE_APP_ID = "github.com.thewh1teagle.vibe"
+# Vibe desktop app installs (macOS .app bundles keep sidecars in Contents/MacOS or Contents/Resources).
+VIBE_APP_DIRS = [
+    Path("/Applications/vibe.app/Contents/MacOS"),
+    Path("/Applications/vibe.app/Contents/Resources"),
+    Path.home() / "Applications/vibe.app/Contents/MacOS",
+    Path.home() / "Applications/vibe.app/Contents/Resources",
+    Path("/usr/bin"),
+    Path("/usr/lib/vibe"),
+    Path("/usr/lib/vibe/binaries"),
+    Path(os.environ.get("LOCALAPPDATA", "/nonexistent")) / "vibe",
+    Path(os.environ.get("PROGRAMFILES", "/nonexistent")) / "vibe",
+]
+# Where the Vibe desktop app stores models it downloaded (its app_local_data_dir).
+VIBE_MODEL_DIRS = [
+    Path.home() / "Library/Application Support" / VIBE_APP_ID,
+    Path.home() / ".local/share" / VIBE_APP_ID,
+    Path(os.environ.get("LOCALAPPDATA", "/nonexistent")) / VIBE_APP_ID,
+]
+EXE = ".exe" if IS_WIN else ""
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """python.org builds on macOS ship without CA certificates until 'Install Certificates.command'
+    is run; fall back to certifi or the system bundle so HTTPS downloads still verify."""
+    ctx = ssl.create_default_context()
+    if ctx.cert_store_stats().get("x509_ca", 0) == 0 and not os.environ.get("SSL_CERT_FILE"):
+        try:
+            import certifi  # type: ignore
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            for bundle in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+                if os.path.exists(bundle):
+                    ctx = ssl.create_default_context(cafile=bundle)
+                    break
+    return ctx
+
+
+SSL_CTX = _ssl_context()
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.HTTPSHandler(context=SSL_CTX)))
 WHISPER_MODELS = {
     # name -> file in huggingface.co/ggerganov/whisper.cpp
     "tiny": "ggml-tiny.bin",
@@ -148,93 +203,154 @@ def multipart(fields: dict, file_field: str, file_path: Path):
 # --------------------------------------------------------------------------- #
 # Dependencies: yt-dlp, ffmpeg
 # --------------------------------------------------------------------------- #
+def _make_executable(path: Path) -> None:
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    if IS_MAC and shutil.which("xattr"):
+        # Files fetched by a browser carry a quarantine flag that makes Gatekeeper block them.
+        subprocess.run(["xattr", "-d", "com.apple.quarantine", str(path)], capture_output=True)
+
+
 def ensure_ytdlp(auto_install: bool) -> list[str]:
-    if exe := shutil.which("yt-dlp"):
-        return [exe]
+    for exe in (shutil.which("yt-dlp"), str(BIN_DIR / f"yt-dlp{EXE}")):
+        if exe and Path(exe).is_file() and os.access(exe, os.X_OK):
+            return [exe]
     probe = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"], capture_output=True)
     if probe.returncode == 0:
         return [sys.executable, "-m", "yt_dlp"]
     if not auto_install:
-        die("yt-dlp not found. Install it (pip install -U yt-dlp) or run without --no-install.")
-    log("yt-dlp not found, installing with pip ...")
+        die("yt-dlp not found. Install it (brew install yt-dlp / pip install -U yt-dlp) "
+            "or run without --no-install.")
+    if IS_MAC and shutil.which("brew"):
+        log("yt-dlp not found, installing with Homebrew ...")
+        if subprocess.run(["brew", "install", "yt-dlp"]).returncode == 0 and shutil.which("yt-dlp"):
+            return [shutil.which("yt-dlp")]
+    log("installing yt-dlp with pip ...")
     cmd = [sys.executable, "-m", "pip", "install", "--user", "-U", "yt-dlp"]
-    if subprocess.run(cmd).returncode != 0:
-        # PEP 668 managed environments refuse --user installs; fall back to a standalone binary.
-        name = {"Windows": "yt-dlp.exe", "Darwin": "yt-dlp_macos"}.get(platform.system(), "yt-dlp")
-        target = BIN_DIR / ("yt-dlp.exe" if name.endswith(".exe") else "yt-dlp")
-        download(f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}", target)
-        target.chmod(target.stat().st_mode | stat.S_IEXEC)
-        return [str(target)]
-    return [sys.executable, "-m", "yt_dlp"]
+    if subprocess.run(cmd).returncode == 0:
+        return [sys.executable, "-m", "yt_dlp"]
+    # PEP 668 managed Pythons (Homebrew, Debian ...) refuse --user installs: use the standalone binary.
+    name = "yt-dlp.exe" if IS_WIN else "yt-dlp_macos" if IS_MAC else "yt-dlp"
+    target = BIN_DIR / f"yt-dlp{EXE}"
+    download(f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{name}", target)
+    _make_executable(target)
+    return [str(target)]
 
 
-def ensure_ffmpeg() -> None:
-    if not shutil.which("ffmpeg"):
-        hint = {"Darwin": "brew install ffmpeg", "Windows": "winget install ffmpeg"}.get(
-            platform.system(), "sudo apt install ffmpeg  (or your distro's package manager)")
-        die(f"ffmpeg is required by yt-dlp and Vibe for audio conversion. Install it: {hint}")
+def find_ffmpeg() -> str | None:
+    candidates = [shutil.which("ffmpeg"), os.environ.get("VIBE_SERVER_FFMPEG_PATH"), str(BIN_DIR / f"ffmpeg{EXE}")]
+    # Homebrew prefixes are not on PATH when the script runs from cron/launchd/Shortcuts.
+    candidates += ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] if IS_MAC else []
+    candidates += [str(d / f"ffmpeg{EXE}") for d in VIBE_APP_DIRS]  # bundled with the Vibe app
+    for c in candidates:
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def ensure_ffmpeg(auto_install: bool) -> str:
+    if ff := find_ffmpeg():
+        return ff
+    if auto_install and IS_MAC:
+        if shutil.which("brew"):
+            log("ffmpeg not found, installing with Homebrew ...")
+            subprocess.run(["brew", "install", "ffmpeg"])
+        else:
+            # The macOS vibe-server release archive ships an ffmpeg binary next to the server.
+            log("ffmpeg not found, fetching the Vibe macOS bundle that includes ffmpeg ...")
+            install_vibe_server(with_ffmpeg=True)
+        if ff := find_ffmpeg():
+            return ff
+    hint = ("brew install ffmpeg" if IS_MAC else "winget install ffmpeg" if IS_WIN
+            else "sudo apt install ffmpeg  (or your distro's package manager)")
+    die(f"ffmpeg is required by yt-dlp and Vibe for audio conversion. Install it: {hint}")
+    return ""
 
 
 # --------------------------------------------------------------------------- #
 # Vibe engine (vibe-server)
 # --------------------------------------------------------------------------- #
 def vibe_asset_name() -> str:
-    system = platform.system()
     machine = platform.machine().lower()
     arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
-    if system == "Linux":
-        return f"vibe-server-linux-{arch}"
-    if system == "Darwin":
+    if IS_MAC:
+        # Apple Silicon Macs report x86_64 when Python runs under Rosetta; prefer the native build.
+        if arch == "amd64" and subprocess.run(["sysctl", "-n", "hw.optional.arm64"],
+                                              capture_output=True, text=True).stdout.strip() == "1":
+            arch = "arm64"
         return f"vibe-server-darwin-{arch}"
-    if system == "Windows":
+    if IS_WIN:
         return "vibe-server-windows-amd64.exe"
-    die(f"unsupported platform {system}/{machine} for vibe-server")
+    if platform.system() == "Linux":
+        return f"vibe-server-linux-{arch}"
+    die(f"unsupported platform {platform.system()}/{machine} for vibe-server")
     return ""
 
 
 def find_vibe_server(explicit: str | None) -> str | None:
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
-    if env := os.environ.get("VIBE_SERVER_BIN"):
-        candidates.append(env)
-    for name in ("vibe-server", "vibe-server.exe"):
-        if exe := shutil.which(name):
-            candidates.append(exe)
-    candidates.append(str(BIN_DIR / ("vibe-server.exe" if platform.system() == "Windows" else "vibe-server")))
-    # Binaries bundled with the Vibe desktop app.
-    candidates += [
-        "/Applications/vibe.app/Contents/MacOS/vibe-server",
-        "/Applications/Vibe.app/Contents/MacOS/vibe-server",
-        "/usr/bin/vibe-server",
-        "/usr/lib/vibe/vibe-server",
-        str(Path(os.environ.get("LOCALAPPDATA", "")) / "vibe" / "vibe-server.exe"),
-        str(Path(os.environ.get("PROGRAMFILES", "")) / "vibe" / "vibe-server.exe"),
-    ]
+    candidates = [explicit, os.environ.get("VIBE_SERVER_BIN"), shutil.which("vibe-server"),
+                  str(BIN_DIR / f"vibe-server{EXE}")]
+    candidates += [str(d / f"vibe-server{EXE}") for d in VIBE_APP_DIRS]  # bundled with the Vibe app
     for c in candidates:
-        p = Path(c)
-        if p.is_file() and os.access(p, os.X_OK):
-            return str(p)
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return c
+    if explicit:
+        die(f"--vibe-bin {explicit} is not an executable file")
     return None
 
 
-def install_vibe_server() -> str:
+def install_vibe_server(with_ffmpeg: bool = False) -> str:
     asset = vibe_asset_name()
-    tags = [os.environ["VIBE_SERVER_VERSION"]] if os.environ.get("VIBE_SERVER_VERSION") else vibe_server_tags(asset)
-    target = BIN_DIR / ("vibe-server.exe" if asset.endswith(".exe") else "vibe-server")
+    # On macOS the release also comes as a .tar.gz that bundles ffmpeg.
+    archive = None
+    if with_ffmpeg and IS_MAC:
+        archive = f"{asset}-with-ffmpeg.tar.gz"
+    wanted = archive or asset
+    tags = [os.environ["VIBE_SERVER_VERSION"]] if os.environ.get("VIBE_SERVER_VERSION") else vibe_server_tags(wanted)
+    target = BIN_DIR / f"vibe-server{EXE}"
     for tag in tags[:5]:
+        url = f"https://github.com/{VIBE_REPO}/releases/download/{tag}/{wanted}"
         try:
-            download(f"https://github.com/{VIBE_REPO}/releases/download/{tag}/{asset}", target)
+            if archive:
+                _install_archive(url, target)
+            else:
+                download(url, target)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:  # tag without a binary for this platform (yet)
                 continue
             raise
-        target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        _make_executable(target)
         log(f"installed vibe-server {tag} -> {target}")
         return str(target)
-    die(f"could not download {asset}. Get it from https://github.com/{VIBE_REPO}/releases?q=server-v "
+    die(f"could not download {wanted}. Get it from https://github.com/{VIBE_REPO}/releases?q=server-v "
         f"and pass --vibe-bin, or set VIBE_SERVER_VERSION=server-vX.Y.Z")
     return ""
+
+
+def _install_archive(url: str, target: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tgz = Path(tmp) / "bundle.tar.gz"
+        download(url, tgz)
+        out = Path(tmp) / "x"
+        with tarfile.open(tgz) as tf:
+            for member in tf.getmembers():  # refuse absolute paths / .. entries
+                if member.name.startswith("/") or ".." in Path(member.name).parts:
+                    raise RuntimeError(f"unsafe path in archive: {member.name}")
+            if hasattr(tarfile, "data_filter"):  # Python 3.12+: also reject links/devices
+                tf.extractall(out, filter="data")
+            else:
+                tf.extractall(out)
+        files = [p for p in out.rglob("*") if p.is_file()]
+        server = next((p for p in files if p.name.startswith("vibe-server")), None)
+        if not server:
+            raise RuntimeError("archive does not contain vibe-server")
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(server, target)
+        for p in files:  # ffmpeg / ffprobe and any dylibs it needs
+            if p != server:
+                dst = BIN_DIR / p.name
+                shutil.copy2(p, dst)
+                if p.name.startswith("ff"):
+                    _make_executable(dst)
 
 
 def vibe_server_tags(asset: str) -> list[str]:
@@ -248,7 +364,8 @@ def vibe_server_tags(asset: str) -> list[str]:
             return tags
     except Exception as exc:
         log(f"GitHub API unavailable ({exc}), trying git ls-remote")
-    if not shutil.which("git"):
+    # On a Mac without Xcode tools /usr/bin/git is only a stub that pops up an installer.
+    if not shutil.which("git") or (IS_MAC and subprocess.run(["xcode-select", "-p"], capture_output=True).returncode):
         return []
     out = subprocess.run(["git", "ls-remote", "--tags", f"https://github.com/{VIBE_REPO}", "server-v*"],
                          capture_output=True, text=True)
@@ -265,12 +382,15 @@ def ensure_model(model: str, auto_install: bool) -> Path:
         return path.resolve()
     if model not in WHISPER_MODELS:
         die(f"model '{model}' is neither a file nor one of: {', '.join(WHISPER_MODELS)}")
-    path = MODEL_DIR / WHISPER_MODELS[model]
-    if path.is_file():
-        return path
+    filename = WHISPER_MODELS[model]
+    # Reuse a model the Vibe desktop app already downloaded instead of fetching it again.
+    for folder in [MODEL_DIR] + VIBE_MODEL_DIRS:
+        if (folder / filename).is_file():
+            return folder / filename
+    path = MODEL_DIR / filename
     if not auto_install:
         die(f"model {path} is missing")
-    download(MODEL_URL.format(WHISPER_MODELS[model]), path)
+    download(MODEL_URL.format(filename), path)
     return path
 
 
@@ -278,7 +398,8 @@ class VibeEngine:
     """Makes sure a vibe-server is reachable and has the requested model loaded."""
 
     def __init__(self, url: str | None, binary: str | None, model: Path, auto_install: bool,
-                 gpu_device: int | None, no_gpu: bool):
+                 gpu_device: int | None, no_gpu: bool, ffmpeg: str | None = None):
+        self.ffmpeg = ffmpeg
         self.url = url.rstrip("/") if url else None
         self.binary = binary
         self.model = model
@@ -305,8 +426,10 @@ class VibeEngine:
             exe = install_vibe_server()
         log(f"starting Vibe engine: {exe}")
         env = dict(os.environ)
-        if ff := shutil.which("ffmpeg"):
-            env.setdefault("VIBE_SERVER_FFMPEG_PATH", ff)
+        if self.ffmpeg:
+            env.setdefault("VIBE_SERVER_FFMPEG_PATH", self.ffmpeg)
+            # vibe-server looks for ffmpeg on PATH first, so put ours there too.
+            env["PATH"] = os.pathsep.join([str(Path(self.ffmpeg).parent), env.get("PATH", "")])
         self.proc = subprocess.Popen(
             [exe, "serve", "--host", "127.0.0.1", "--port", "0"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -416,7 +539,8 @@ def expand_inputs(ytdlp: list[str], inputs: list[str], cookies: str | None) -> l
     return videos
 
 
-def download_audio(ytdlp: list[str], url: str, workdir: Path, cookies: str | None) -> tuple[Path, dict]:
+def download_audio(ytdlp: list[str], url: str, workdir: Path, cookies: str | None,
+                   ffmpeg: str | None = None) -> tuple[Path, dict]:
     workdir.mkdir(parents=True, exist_ok=True)
     cmd = ytdlp + ["--no-playlist", "--no-warnings", "--quiet", "--no-progress",
                    "-f", "bestaudio/best", "-x", "--audio-format", "wav",
@@ -425,6 +549,8 @@ def download_audio(ytdlp: list[str], url: str, workdir: Path, cookies: str | Non
                    "--print", "after_move:filepath", url]
     if cookies:
         cmd[len(ytdlp):len(ytdlp)] = ["--cookies-from-browser", cookies]
+    if ffmpeg:
+        cmd[len(ytdlp):len(ytdlp)] = ["--ffmpeg-location", ffmpeg]
     out = subprocess.run(cmd, capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"yt-dlp failed: {out.stderr.strip()[-500:]}")
@@ -680,10 +806,11 @@ def main(argv=None) -> int:
         die("give at least one URL or --batch-file (see --help)")
 
     auto_install = not args.no_install
-    ensure_ffmpeg()
+    ffmpeg = ensure_ffmpeg(auto_install)
     ytdlp = ensure_ytdlp(auto_install)
     model = ensure_model(args.model, auto_install)
-    engine = VibeEngine(args.vibe_url, args.vibe_bin, model, auto_install, args.gpu_device, args.no_gpu)
+    engine = VibeEngine(args.vibe_url, args.vibe_bin, model, auto_install, args.gpu_device, args.no_gpu, ffmpeg)
+    keep_awake()
 
     videos = expand_inputs(ytdlp, inputs, args.cookies_from_browser)
     if args.limit:
@@ -704,7 +831,7 @@ def main(argv=None) -> int:
                 continue
             try:
                 log(f"[{n}/{len(videos)}] downloading {video['url']}")
-                audio, info = download_audio(ytdlp, video["url"], audio_dir, args.cookies_from_browser)
+                audio, info = download_audio(ytdlp, video["url"], audio_dir, args.cookies_from_browser, ffmpeg)
                 title = info.get("title") or video["title"] or video["id"]
                 folder = out_root / f"{safe_name(title)} [{video['id']}]"
                 folder.mkdir(parents=True, exist_ok=True)
@@ -751,6 +878,13 @@ def main(argv=None) -> int:
     for url, err in failures:
         log(f"  failed: {url} — {err[:200]}")
     return 1 if failures else 0
+
+
+def keep_awake() -> None:
+    """On macOS, stop the Mac from idle-sleeping while long downloads/transcriptions run."""
+    if IS_MAC and shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def write_index(out_root: Path) -> None:

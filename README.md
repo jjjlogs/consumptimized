@@ -4,7 +4,26 @@ Download YouTube videos (one, many, playlists or channels) with **yt-dlp**, tran
 **locally** with the [Vibe](https://github.com/thewh1teagle/vibe) engine (`vibe-server`, whisper.cpp)
 from English or Russian, save the transcripts and summarize them the way you ask.
 
-Single file, Python 3.9+ standard library only.
+Single file, Python 3.9+ standard library only. Works on **macOS** (Apple Silicon and Intel),
+Linux and Windows.
+
+## macOS
+
+```bash
+xcode-select --install          # gives you python3 + git, if you don't have them yet
+brew install ffmpeg yt-dlp      # optional: the script installs them itself if missing
+chmod +x ytscribe.py
+./ytscribe.py https://youtu.be/VIDEO_ID
+```
+
+- Runs on the GPU through Metal on Apple Silicon (native `arm64` build, also when Python runs under Rosetta).
+- If you have the **Vibe app** in `/Applications` or `~/Applications`, its bundled `vibe-server` and
+  `ffmpeg` are used, and so are the models it already downloaded.
+- Without Homebrew, a missing ffmpeg comes from Vibe's macOS bundle (`vibe-server-darwin-*-with-ffmpeg`),
+  and a missing yt-dlp from pip or the standalone `yt-dlp_macos` binary.
+- Files go to `~/Library/Application Support/ytscribe` (override with `YTSCRIBE_HOME`).
+- A python.org Python without CA certificates still works: certifi or `/etc/ssl/cert.pem` is used.
+- The Mac is kept awake (`caffeinate`) while a batch runs.
 
 ## What it checks and sets up for you
 
@@ -12,9 +31,9 @@ Single file, Python 3.9+ standard library only.
 |---|---|
 | ffmpeg | must be installed (the script tells you how if it isn't) |
 | yt-dlp | uses `yt-dlp` on PATH / `python -m yt_dlp`; otherwise installs it with pip, or downloads the standalone binary |
-| Vibe engine | looks for `vibe-server` (`--vibe-bin`, `$VIBE_SERVER_BIN`, PATH, `~/.local/share/ytscribe/bin`, the Vibe desktop app's bundled one); downloads the latest `server-v*` release from GitHub if missing |
+| Vibe engine | looks for `vibe-server` (`--vibe-bin`, `$VIBE_SERVER_BIN`, PATH, the app data `bin` folder, the Vibe desktop app's bundled one); downloads the latest `server-v*` release from GitHub if missing |
 | running | starts `vibe-server serve` on a free port and waits for its `ready` line, or attaches to one you already run (`--vibe-url`) after checking `/health` |
-| model | downloads the Whisper model (default `large-v3-turbo`, good for EN + RU) into `~/.local/share/ytscribe/models` and loads it via `/v1/models/load`, unless it is already loaded |
+| model | downloads the Whisper model (default `large-v3-turbo`, good for EN + RU) into the app data folder (`~/Library/Application Support/ytscribe/models` on macOS, `~/.local/share/ytscribe/models` on Linux), reusing the Vibe app's models if present, and loads it via `/v1/models/load`, unless it is already loaded |
 
 Use `--no-install` to forbid any download/installation.
 
